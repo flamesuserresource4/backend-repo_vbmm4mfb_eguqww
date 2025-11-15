@@ -1,8 +1,14 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+from bson import ObjectId
 
-app = FastAPI()
+from database import db, create_document, get_documents
+from schemas import Note
+
+app = FastAPI(title="Papyrus Notes API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -12,58 +18,102 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class NoteCreate(Note):
+    pass
+
+class NoteOut(Note):
+    id: str
+
 @app.get("/")
 def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
-
-@app.get("/api/hello")
-def hello():
-    return {"message": "Hello from the backend API!"}
+    return {"message": "Papyrus Notes Backend is running"}
 
 @app.get("/test")
 def test_database():
-    """Test endpoint to check if database is available and accessible"""
     response = {
         "backend": "✅ Running",
         "database": "❌ Not Available",
-        "database_url": None,
-        "database_name": None,
-        "connection_status": "Not Connected",
-        "collections": []
     }
-    
     try:
-        # Try to import database module
-        from database import db
-        
         if db is not None:
-            response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
-            response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
-            try:
-                collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
-                response["database"] = "✅ Connected & Working"
-            except Exception as e:
-                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
+            response["database"] = "✅ Connected"
+            response["collections"] = db.list_collection_names()
         else:
-            response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
+            response["database"] = "❌ Not Connected"
     except Exception as e:
-        response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
+        response["database"] = f"❌ Error: {str(e)[:120]}"
     return response
 
+# Helper to convert Mongo docs
+
+def serialize_note(doc) -> NoteOut:
+    return NoteOut(
+        id=str(doc.get("_id")),
+        title=doc.get("title", ""),
+        content=doc.get("content", ""),
+        tags=doc.get("tags", []),
+        color=doc.get("color"),
+        is_pinned=doc.get("is_pinned", False),
+        mood=doc.get("mood"),
+    )
+
+@app.post("/api/notes", response_model=dict)
+async def create_note(note: NoteCreate):
+    try:
+        note_id = create_document("note", note)
+        return {"id": note_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/notes", response_model=List[NoteOut])
+async def list_notes(tag: Optional[str] = None, q: Optional[str] = None, pinned: Optional[bool] = None):
+    try:
+        filter_dict = {}
+        if tag:
+            filter_dict["tags"] = {"$in": [tag]}
+        if pinned is not None:
+            filter_dict["is_pinned"] = pinned
+        if q:
+            filter_dict["$or"] = [
+                {"title": {"$regex": q, "$options": "i"}},
+                {"content": {"$regex": q, "$options": "i"}},
+            ]
+        docs = get_documents("note", filter_dict)
+        # Sort pinned first then newest
+        docs.sort(key=lambda d: (not d.get("is_pinned", False), d.get("created_at", 0)), reverse=False)
+        return [serialize_note(d) for d in docs]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/notes/{note_id}", response_model=dict)
+async def delete_note(note_id: str):
+    try:
+        if db is None:
+            raise Exception("Database not available")
+        result = db["note"].delete_one({"_id": ObjectId(note_id)})
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Note not found")
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/api/notes/{note_id}", response_model=dict)
+async def update_note(note_id: str, payload: dict):
+    try:
+        if db is None:
+            raise Exception("Database not available")
+        payload.pop("_id", None)
+        payload["updated_at"] = payload.get("updated_at")
+        result = db["note"].update_one({"_id": ObjectId(note_id)}, {"$set": payload})
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Note not found")
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
